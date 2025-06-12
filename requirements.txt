@@ -10,3 +10,8 @@ psycopg2-binary
 mysql-connector-python
 babel
 pypandoc
+python-multipart
+tabulate
+openpyxl
+pdflatex
+python-dotenv

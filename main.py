@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Query, BackgroundTasks
+from fastapi import FastAPI, Request, Query, BackgroundTasks, Form, File, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
@@ -33,6 +33,39 @@ def cleanup_temp_files(*paths):
             os.remove(path)
         except Exception:
             pass
+
+def get_filtered_data(start_date=None, end_date=None, providers=None):
+    filters = []
+    params = {}
+
+    if start_date and end_date:
+        filters.append("appointment_date BETWEEN :start AND :end")
+        params["start"] = start_date
+        params["end"] = end_date
+
+    if providers:
+        provider_placeholders = ','.join(f":p{i}" for i in range(len(providers)))
+        filters.append(f"pr.full_name IN ({provider_placeholders})")
+        params.update({f"p{i}": name for i, name in enumerate(providers)})
+
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    query = text(f"""
+        SELECT 
+            ap.patient_name, ap.patient_email,
+            ap.appointment_date, ap.appointment_time,
+            ap.service, ap.notes,
+            pr.full_name AS practitioner
+        FROM appointments ap
+        JOIN practitioners pr ON ap.practitioner_id = pr.id
+        {where_clause}
+        ORDER BY ap.appointment_date, ap.appointment_time
+    """)
+
+    with engine.begin() as conn:
+        result = conn.execute(query, params)
+        df = pd.DataFrame(result.fetchall(), columns=result.keys())
+        return df
 
 @app.get("/practitioners")
 async def get_practitioners():
@@ -82,6 +115,28 @@ async def upload_appointments(provider: str = Form(...), file: UploadFile = File
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.get("/export-excel")
+def export_excel(
+    startDate: str = Query(None),
+    endDate: str = Query(None),
+    providers: list[str] = Query(None)
+):
+    df = get_filtered_data(startDate, endDate, providers)
+    if df.empty:
+        return JSONResponse(status_code=404, content={"error": "No data found"})
+
+    # Generate Excel in memory
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Appointments")
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=appointments.xlsx"}
+    )
+
+@app.get("/generate-report")
 async def generate_report(request: Request, background_tasks: BackgroundTasks, startDate: str = None, endDate: str = None, providers: list[str] = Query(default=[])):
     try:
         # Extract Accept-Language
@@ -114,18 +169,21 @@ async def generate_report(request: Request, background_tasks: BackgroundTasks, s
         prompt = f"Summarize the following dental appointment data: {df.to_markdown(index=False)}"
         summary = "No summary generated."
         if OPENAI_API_KEY:
-            response = openai.ChatCompletion.create(
+            client = openai.Client()
+            
+            response = client.chat.completions.create(
                 model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": "You are an expert data analyst."},{"role": "user", "content": prompt}],
                 max_tokens=300
             )
-            summary = response.choices[0].message.content.strip()
+            summary = response.choices[0].message.content #.strip()
 
         # Format date with locale
+        locale_code = locale_code.replace("-", "_")
         today = format_date(date.today(), locale=locale_code)
 
         # Load and populate Word template
-        template_path = "./report_template.dotx"
+        template_path = "./report_template.docx"
         doc = DocxTemplate(template_path)
 
         # Convert dataframe to list of dicts for docxtpl
