@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pandas
+openai
+python-docx
+docxtpl
+fpdf
+sqlalchemy
+psycopg2-binary
+mysql-connector-python
+babel
+pypandoc
