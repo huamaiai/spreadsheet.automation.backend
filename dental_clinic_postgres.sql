@@ -41,3 +41,10 @@ INSERT INTO appointments (id, patient_name, patient_email, appointment_date, app
 INSERT INTO appointments (id, patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id, created_at) VALUES (18, 'Patient 8 B', 'pb8@example.com', '2025-06-19', '13:30:00', 'Root Canal', 'Note 8', 2, '2025-06-12 12:46:23');
 INSERT INTO appointments (id, patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id, created_at) VALUES (19, 'Patient 9 B', 'pb9@example.com', '2025-06-20', '10:30:00', 'Whitening', 'Note 9', 2, '2025-06-12 12:46:23');
 INSERT INTO appointments (id, patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id, created_at) VALUES (20, 'Patient 10 B', 'pb10@example.com', '2025-06-21', '11:30:00', 'Teeth Cleaning', 'Note 10', 2, '2025-06-12 12:46:23');
+
+
+-- Adjust sequence for appointments table
+SELECT setval('appointments_id_seq', (SELECT MAX(id) FROM appointments));
+
+-- Do the same for practitioners if needed:
+SELECT setval('practitioners_id_seq', (SELECT MAX(id) FROM practitioners));

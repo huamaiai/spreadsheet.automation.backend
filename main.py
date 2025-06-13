@@ -9,8 +9,9 @@ from io import BytesIO
 import openai
 import os
 from babel.dates import format_date
-from datetime import date
+from datetime import date, datetime
 import tempfile
+import traceback
 
 app = FastAPI(title="Dental Clinic API")
 
@@ -22,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dental_clinic.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 engine = create_engine(DATABASE_URL)
 openai.api_key = OPENAI_API_KEY
@@ -67,6 +68,19 @@ def get_filtered_data(start_date=None, end_date=None, providers=None):
         df = pd.DataFrame(result.fetchall(), columns=result.keys())
         return df
 
+def generate_openai_summary(prompt: str) -> str:
+    try:
+        client = openai.Client()
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": "You are an expert data analyst."},{"role": "user", "content": prompt}],
+            max_tokens=300
+        )
+        return response.choices[0].message.content #.strip()
+    except Exception as e:
+        print("❌ OpenAI API call failed:", e)
+        return "Summary not available due to an error."
+
 @app.get("/practitioners")
 async def get_practitioners():
     try:
@@ -77,19 +91,29 @@ async def get_practitioners():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/submit-appointment")
-async def submit_appointment(data: dict):
+async def submit_appointment(request: Request):
+    data = await request.json()
     try:
         with engine.begin() as conn:
-            res = conn.execute(text("SELECT id FROM practitioners WHERE full_name = :name"), {"name": data.get("service")}).fetchone()
+            res = conn.execute(
+                text("SELECT id FROM practitioners WHERE full_name = :name"),
+                {"name": data.get("service")}
+            ).fetchone()
             practitioner_id = res[0] if res else conn.execute(text("SELECT id FROM practitioners LIMIT 1")).fetchone()[0]
 
             conn.execute(text("""
                 INSERT INTO appointments (patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id)
                 VALUES (:name, :email, :date, :time, :service, :notes, :pid)
             """), {
-                "name": data["name"], "email": data["email"], "date": data["date"], "time": data["time"],
-                "service": data["service"], "notes": data.get("notes", ""), "pid": practitioner_id
+                "name": data["name"],
+                "email": data["email"],
+                "date": data["date"],
+                "time": data["time"],
+                "service": data["service"],
+                "notes": data.get("notes", ""),
+                "pid": practitioner_id
             })
+
         return JSONResponse(status_code=201, content={"message": "Appointment created"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": str(e)})
@@ -97,22 +121,62 @@ async def submit_appointment(data: dict):
 @app.post("/upload-appointments")
 async def upload_appointments(provider: str = Form(...), file: UploadFile = File(...)):
     try:
-        df = pd.read_excel(file.file)
-        with engine.begin() as conn:
-            res = conn.execute(text("SELECT id FROM practitioners WHERE full_name = :name"), {"name": provider}).fetchone()
-            practitioner_id = res[0] if res else conn.execute(text("INSERT INTO practitioners (full_name) VALUES (:name) RETURNING id"), {"name": provider}).scalar()
+        # Save UploadFile to a real temp file (fix for SpooledTemporaryFile)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
+        df = pd.read_excel(tmp_path)
+
+        with engine.begin() as conn:
+            # Check if provider exists
+            result = conn.execute(text("SELECT id FROM practitioners WHERE full_name = :name"), {"name": provider}).fetchone()
+            if result:
+                practitioner_id = result[0]
+            else:
+                res = conn.execute(text("INSERT INTO practitioners (full_name) VALUES (:name) RETURNING id"), {"name": provider})
+                practitioner_id = res.scalar()
+
+            added = 0
             for _, row in df.iterrows():
-                conn.execute(text("""
-                    INSERT INTO appointments (patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id)
-                    VALUES (:pn, :pe, :ad, :at, :s, :n, :pid)
+                # Basic validation
+                if not row.get("Patient Name") or not row.get("Appointment Date") or not row.get("Appointment Time"):
+                    continue
+
+                # Check if same record exists
+                exists = conn.execute(text("""
+                    SELECT id FROM appointments
+                    WHERE patient_name = :name
+                      AND appointment_date = :date
+                      AND appointment_time = :time
+                      AND practitioner_id = :pid
                 """), {
-                    "pn": row['patient_name'], "pe": row['patient_email'], "ad": row['appointment_date'],
-                    "at": row['appointment_time'], "s": row['service'], "n": row.get('notes', ''), "pid": practitioner_id
-                })
-        return {"message": "Upload successful"}
+                    "name": row["Patient Name"],
+                    "date": str(row["Appointment Date"]),
+                    "time": str(row["Appointment Time"]),
+                    "pid": practitioner_id
+                }).fetchone()
+
+                if not exists:
+                    conn.execute(text("""
+                        INSERT INTO appointments
+                        (patient_name, patient_email, appointment_date, appointment_time, service, notes, practitioner_id)
+                        VALUES (:name, :email, :date, :time, :service, :notes, :pid)
+                    """), {
+                        "name": row.get("Patient Name"),
+                        "email": row.get("Patient Email"),
+                        "date": str(row["Appointment Date"]),
+                        "time": str(row["Appointment Time"]),
+                        "service": row.get("Service"),
+                        "notes": row.get("Notes"),
+                        "pid": practitioner_id
+                    })
+                    added += 1
+
+        return {"message": f"{added} appointments added for {provider}."}
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"message": str(e)})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/export-excel")
 def export_excel(
@@ -137,78 +201,92 @@ def export_excel(
     )
 
 @app.get("/generate-report")
-async def generate_report(request: Request, background_tasks: BackgroundTasks, startDate: str = None, endDate: str = None, providers: list[str] = Query(default=[])):
+async def generate_report(background: BackgroundTasks, startDate: str = None, endDate: str = None, providers: list[str] = Query(default=[])):
     try:
-        # Extract Accept-Language
-        accept_language = request.headers.get("accept-language", "en")
-        locale_code = accept_language.split(",")[0]
+        conditions = []
+        params = {}
 
-        # Query data
-        query = """
+        if startDate and endDate:
+            conditions.append("appointment_date BETWEEN :start AND :end")
+            params.update({"start": startDate, "end": endDate})
+
+        if providers:
+            conditions.append("p.full_name = ANY(:providers)")
+            params["providers"] = providers
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
             SELECT a.patient_name, a.patient_email, a.appointment_date, a.appointment_time,
                    a.service, a.notes, p.full_name AS practitioner
             FROM appointments a
             JOIN practitioners p ON a.practitioner_id = p.id
-            WHERE 1=1
+            {where_clause}
+            ORDER BY a.appointment_date, a.appointment_time
         """
-        params = {}
-        if startDate and endDate:
-            query += " AND appointment_date BETWEEN :start AND :end"
-            params.update({"start": startDate, "end": endDate})
-        if providers:
-            query += " AND p.full_name IN :providers"
-            params.update({"providers": tuple(providers)})
 
-        with engine.begin() as conn:
+        # ✅ DEBUG LOGGING
+        #print("\n--- GENERATE REPORT ---")
+        #print("QUERY:", query)
+        #print("PARAMS:", params)
+
+        # ✅ SAFE DB ACCESS
+        with engine.connect() as conn:
             df = pd.read_sql(text(query), conn, params=params)
 
         if df.empty:
-            return JSONResponse(status_code=404, content={"message": "No data found"})
+            return JSONResponse(status_code=404, content={"error": "No data found for selected filters."})
 
-        # Generate summary
-        prompt = f"Summarize the following dental appointment data: {df.to_markdown(index=False)}"
-        summary = "No summary generated."
-        if OPENAI_API_KEY:
-            client = openai.Client()
-            
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "system", "content": "You are an expert data analyst."},{"role": "user", "content": prompt}],
-                max_tokens=300
-            )
-            summary = response.choices[0].message.content #.strip()
+        # Generate summary using OpenAI
+        summary_prompt = f"Summarize this dental appointment report:\n\n{df.to_string(index=False)}"
+        summary = generate_openai_summary(summary_prompt)
 
-        # Format date with locale
-        locale_code = locale_code.replace("-", "_")
-        today = format_date(date.today(), locale=locale_code)
+        # Prepare Word report based on uploaded template
+        from docxtpl import DocxTemplate
+        from docx.shared import Inches
+        from docx.enum.section import WD_ORIENT
+        from docx import Document
+        import pypandoc
 
-        # Load and populate Word template
         template_path = "./report_template.docx"
+        if not os.path.exists(template_path):
+            return JSONResponse(status_code=500, content={"error": "Template not found."})
+
         doc = DocxTemplate(template_path)
 
-        # Convert dataframe to list of dicts for docxtpl
+        # Format today’s date according to locale
+        date_str = datetime.now().strftime("%B %d, %Y")
+
+        # Render table rows for Word template
         table_data = df.to_dict(orient="records")
-        doc.render({
-            "dateField": today,
+
+        context = {
+            "dateField": date_str,
             "summaryField": summary,
-            "rawDataField": table_data
-        })
+            "rawDataField": table_data,
+        }
 
-        # Save to temporary docx file
-        temp_docx = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-        doc.save(temp_docx.name)
+        doc.render(context)
 
-        # Convert to PDF using pypandoc
-        output_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        pypandoc.convert_file(temp_docx.name, "pdf", outputfile=output_pdf.name)
-        
-        background_tasks.add_task(cleanup_temp_files, temp_docx.name, output_pdf.name)
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as temp_docx:
+            doc.save(temp_docx.name)
 
-        # Stream back PDF
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as output_pdf:
+            pypandoc.convert_file(temp_docx.name, "pdf", outputfile=output_pdf.name)
+
+        # Schedule deletion
+        background.add_task(cleanup_temp_files, temp_docx.name, output_pdf.name)
+
         return StreamingResponse(
-            open(output_pdf.name, "rb"),
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=clinic_report.pdf"}
+            open(output_pdf.name, "rb"), 
+            media_type="application/pdf", 
+            headers={
+                "Content-Disposition": "attachment; filename=appointment_report.pdf"
+            },
+            background=background
         )
+
     except Exception as e:
+        print("\n⚠️ Exception in /generate-report:")
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
