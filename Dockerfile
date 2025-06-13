@@ -4,7 +4,10 @@ FROM python:3.11-slim
 RUN apt-get update && \
     apt-get install -y pandoc libreoffice && \
     apt-get clean
-RUN apt-get update && apt-get install -y pandoc texlive texlive-xetex texlive-latex-extra
+RUN apt-get update && \
+    apt-get install -y pandoc texlive texlive-xetex texlive-latex-extra && \
+    apt-get autoremove -y && \
+    apt-get clean
 
 WORKDIR /app
 COPY . /app
